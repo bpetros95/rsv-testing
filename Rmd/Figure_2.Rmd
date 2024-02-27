@@ -544,7 +544,7 @@ fig2a
 rm(test_age, test_age_long)
 ```
 
-Use bootstrapping to generate a post-emergence testing df with the age distribution (in 90-day bins) derived from the pre-pandemic testing df. Plot the pre-pandemic, post-emergence, and test-adjusted age distributions of tested patients (Supplementary Figure 2).
+Use bootstrapping to generate a post-emergence testing df with the age distribution (in 90-day bins) derived from the pre-pandemic testing df. Plot the pre-pandemic, post-emergence, and test-adjusted age distributions of tested patients (Supplementary Figure 3).
 
 ```{r}
 # match testing by 3-month periods of age
@@ -560,7 +560,7 @@ age_tests <- rbind(data.frame(Age = pre_ptest$Admit_Age_In_Days/365, Group = "Pr
                    data.frame(Age = boot_post$Admit_Age_In_Days/365, Group = "Post-Emergence\n(Test Adjusted)"))
 age_tests$Group = factor(age_tests$Group, levels = c("Pre-Pandemic", "Post-Emergence", "Post-Emergence\n(Test Adjusted)"))
 
-sf2 <- ggplot(age_tests, aes(x = Group, y = Age)) +
+sf3 <- ggplot(age_tests, aes(x = Group, y = Age)) +
   geom_boxplot(outlier.shape = NA, fill = "grey") +
   labs(x = "", y = "Age of Tested Individuals (Years)") +
   theme_classic() +
@@ -576,9 +576,9 @@ sf2 <- ggplot(age_tests, aes(x = Group, y = Age)) +
   scale_y_continuous(breaks = c(0, 2, 4, 6, 8, 10, 12, 14, 16, 18)) +
   theme(legend.position = "none",
         text = element_text(size = 12))
-sf2
-ggsave("figs/suppfig2.pdf", plot = sf2, width = 6, height = 6)
-rm(age_tests, sf2)
+sf3
+ggsave("figs/suppfig3.pdf", plot = sf3, width = 6, height = 6)
+rm(age_tests, sf3)
 ```
 
 Assess whether the distribution of patients diagnosed with RSV would have changed if the age of patients tested for RSV remained constant from the pre-pandemic to the post-emergence phase. Conduct 50 replicates of bootstrapping to ensure that the results are robust to sampling error.
