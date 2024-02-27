@@ -377,7 +377,7 @@ report_prop_coefficients <- function(lm_model, alpha = 0.05) {
 Create objects that will be used for plotting.
 
 ```{r}
-## plotting objects
+# shade every other year
 grey_years <- seq(year(min(tests$date)), year(max(tests$date))-1, by = 2)
 # sequence of 3-mo date intervals
 break_dates <- seq(min(tests$date), max(tests$date)+31, by = "3 months")
@@ -674,7 +674,7 @@ sf2a <- ggplot(flu_counts, aes(x = month, y = count)) +
 sf2a
 rm(flu, flu_counts, flu_model)
 
-#monthly test volume
+# monthly test volume
 flutest_counts = data.frame("month" = flutest$date, "count" = flutest$ED_tests + flutest$IP_tests)
 
 # model for influenza test volume
