@@ -1,0 +1,620 @@
+---
+title: "Figure 3"
+author: "Brittany A. Petros"
+date: "2024-02-26"
+output: pdf_document
+---
+
+Set up the workspace.
+
+```{r}
+rm(list=ls(all.names=TRUE))
+setwd("/Users/bpetros/Desktop/PHIS")
+libs <- c("cowplot", "ggplot2", "lubridate", "scales", "tidyverse")
+invisible(lapply(libs, function(x) suppressPackageStartupMessages(library(x, character.only = TRUE))))
+options(stringsAsFactors=FALSE, scipen = 999)
+theme_set(theme_classic())
+```
+
+Read in the cleaned input files.
+
+```{r}
+# read in cleaned pt data
+pt <- read.csv("cleaned/rsv_patient.csv")
+pt$Date = ymd(pt$Discharge_Date)
+
+# read in cleaned flu data
+flu <- read.csv("cleaned/flu.csv")
+flu$date = ymd(flu$date)
+```
+
+This function takes a df with a column named "Date" of type Date and counts the number of rows with a date in each month of the study period.
+
+```{r}
+# monthly volume
+count_volume <- function(data){
+  counts <- data %>%
+    group_by(month = floor_date(Date, "month"), .drop = TRUE) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    ungroup() %>%
+    complete(month = seq(as.Date("2013-07-01"), as.Date("2023-06-01"), by = "1 month"), fill = list(count = 0))
+  return(counts)}
+```
+
+This function takes a df with columns "count" (integer) and "month" (Date) as input. It uses interrupted time series (ITS) analysis to identify trends in volume, considering both linear and log-linear models with the following independent variables:
+
+(i) time ($t$),
+(ii) indicator variables for the intermediate period ($I_p$) and the post-emergence phase ($I_e$),
+(iii) variables enabling a change in slope for each phase, and
+(iv) harmonic terms to model seasonality ($H_0, H_p, H_e$).
+
+$$
+Linear: volume = a_o + a_1* I_p + a_2*I_e + B_0*t + B_1*I_p*t + B_2*I_e*t + H_0 + H_p + H_e
+$$
+
+$$
+Log-Linear: log(volume) = a_o + a_1* I_p + a_2*I_e + B_0*t + B_1*I_p*t + B_2*I_e*t + H_0 + H_p + H_e
+$$
+
+We constructed models with all combinations of 0-2 harmonic terms per phase, selecting either the linear or the log-linear model by comparing transformation-adjusted AICs.
+
+When the argument `include_pandemic` is set to `FALSE`, the function models volumes under the counterfactual scenario in which pandemic-associated disruptions in volume did not occur.
+
+```{r}
+# function to find the best model with or without pandemic predictors
+find_best_model <- function(df, include_pandemic = TRUE) {
+  
+  if(include_pandemic) {
+    # add phase-specific predictors
+    df <- df %>%
+      mutate(time = 1:nrow(.),
+             sc2 = as.numeric(month >= ymd("2020-04-01") & month < ymd("2021-04-01")),
+             post = as.numeric(month >= ymd("2021-04-01")),
+             post_slope = ifelse(post == 1, cumsum(post), 0),
+             sc_slope = ifelse(sc2 == 1, cumsum(sc2), 0))
+    
+    # create harmonic terms and append to the data frame
+    sin_term <- sin(2*pi*df$time /(12))
+    cos_term <- cos(2*pi*df$time /(12))
+    df[paste0("harmonic_sin_term")] <- (1-df$sc2-df$post)*sin_term
+    df[paste0("harmonic_cos_term")] <- (1-df$sc2-df$post)*cos_term
+    df[paste0("pandemic_sin_season")] <- df$sc2*sin_term
+    df[paste0("pandemic_cos_season")] <- df$sc2*cos_term
+    df[paste0("post_sin_season")] <- df$post*sin_term
+    df[paste0("post_cos_season")] <- df$post*cos_term
+    
+    # always include these predictors
+    fixed_predictors <- c("time", "sc2", "sc_slope", "post", "post_slope")
+  } else {
+    # if considering counterfactual, only time-dependent parameter is time
+    df <- df %>%
+      mutate(time = 1:nrow(.))
+    
+    # create harmonic terms and append to the data frame
+    df[paste0("harmonic_sin_term")] <-  sin(2*pi*df$time /(12))
+    df[paste0("harmonic_cos_term")] <- cos(2*pi*df$time /(12))
+    fixed_predictors <- c("time")}
+  
+  # create a vector of predictor variables
+  predictor_vars <- colnames(df)[!colnames(df) %in% c("count", "month")]
+  
+  # initialize variables to keep track of the best models and their AIC values
+  best_model_count <- NULL
+  best_aic_count <- Inf
+  best_model_log_count <- NULL
+  best_aic_log_count <- Inf
+  
+  # loop through both possible response variables: count and log(count)
+  for (response_var in c("count", "log(count)")) {
+    for (i in 1:length(predictor_vars)) {
+      combinations <- combn(predictor_vars, i)
+      for (j in 1:ncol(combinations)) {
+        # include "time" and other fixed predictors in the formula for each model
+        formula_str <- paste(response_var, "~", paste(c(fixed_predictors, combinations[, j]), collapse = " + "))
+        formula <- as.formula(formula_str)
+        model <- lm(formula, data = df)
+        aic <- AIC(model)
+        
+        # select the best log-linear and linear models based on AIC
+        if (response_var == "count" && aic < best_aic_count) {
+          best_model_count <- model
+          best_aic_count <- aic
+        } else if (response_var == "log(count)" && aic < best_aic_log_count) {
+          best_model_log_count <- model
+          best_aic_log_count <- aic}}}}
+  
+  # choose the log-linear or linear model based on transformation-adjusted AIC
+  sum_log_coefficients <- sum((coef(best_model_log_count))[!is.na(coef(best_model_log_count))])
+  if (best_aic_count < (best_aic_log_count + 2 * sum_log_coefficients)) {
+    best_model <- best_model_count
+    response_var <- "count"
+  } else {
+    best_model <- best_model_log_count
+    response_var <- "log(count)"}
+  return(best_model)}
+```
+
+This function takes as input a df with the following columns: "date" (Date), "numerator" (integer), and "denominator" (integer). It outputs a data frame with the proportion and with the independent variables that will be used for model fitting.
+
+```{r}
+# prepare plotting data
+create_plotting_df <- function(data, column = "", value = "", monthly = FALSE) {
+  if (monthly) {
+    counts <- data %>%
+      group_by(month = floor_date(date, "month")) %>%
+      summarize(
+        numerator = sum(numerator),
+        denominator = sum(denominator),
+        plot_ratio = numerator / denominator,
+        tot = denominator) %>%
+      ungroup() %>%
+      mutate(numeric_month = month(month),
+             time = 1:nrow(.),
+             sc2 = as.numeric(month >= ymd("2020-04-01") & month < ymd("2021-04-01")),
+             post = as.numeric(month >= ymd("2021-04-01")),
+             post_slope = ifelse(post == 1, cumsum(post), 0),
+             sc_slope = ifelse(sc2 == 1, cumsum(sc2), 0))
+  } else {
+    counts = data %>%
+      mutate(month = floor_date(Date, "month")) %>%
+      group_by(month) %>%
+      summarize(countY = sum(!!sym(column) == value),
+                tot = n(),  # save the number of data points
+                plot_ratio = countY / tot) %>%
+      ungroup() %>%
+      mutate(numeric_month = month(month),
+             time = 1:nrow(.),
+             sc2 = as.numeric(month >= ymd("2020-04-01") & month < ymd("2021-04-01")),
+             post = as.numeric(month >= ymd("2021-04-01")),
+             post_slope = ifelse(post == 1, cumsum(post), 0),
+             sc_slope = ifelse(sc2 == 1, cumsum(sc2), 0))}
+  return(counts)}
+```
+
+This function takes the df that is the output of the function `create_proportion_df` and a string, `ylabel`, as input. It uses interrupted time series (ITS) analysis to identify trends in a proportion over time, considering linear models with the following independent variables:
+
+(i) time ($t$),
+(ii) indicator variables for the intermediate period ($I_p$) and the post-emergence phase ($I_e$),
+(iii) variables enabling a change in slope for each phase, and
+(iv) harmonic terms to model seasonality ($H_0, H_p, H_e$).
+
+$$
+proportion = a_o + a_1* I_p + a_2*I_e + B_0*t + B_1*I_p*t + B_2*I_e*t + H_0 + H_p + H_e
+$$
+
+It plots the original data points and the model fit.
+
+```{r}
+# plot proportions
+generate_and_plot_proportion_model <- function(counts, ylabel) {
+  generate_and_compare_models <- function(data, n_harmonics) {
+    results <- list()
+    # create a vector of predictor variables
+    predictor_vars <- c("harmonic_1_sin_term", "harmonic_1_cos_term", "pandemic_1_sin_season",
+                        "pandemic_1_cos_season","post_1_sin_season","post_1_cos_season",
+                        "harmonic_2_sin_term", "harmonic_2_cos_term", "pandemic_2_sin_season",
+                        "pandemic_2_cos_season","post_2_sin_season","post_2_cos_season")
+    # always include these predictors
+    fixed_predictors <- c("time", "sc2", "sc_slope", "post", "post_slope")
+    formula <- paste("plot_ratio", "~", paste(fixed_predictors, collapse = " + "))
+    best_model <- lm(as.formula(formula), data)
+    best_aic <- AIC(best_model)
+    for (i in 1:length(predictor_vars)) {
+      combinations <- combn(predictor_vars, i)
+      for (j in 1:ncol(combinations)) {
+        # fit each model
+        formula_str <- paste("plot_ratio", "~", paste(c(fixed_predictors, combinations[, j]), collapse = " + "))
+        formula <- as.formula(formula_str)
+        model <- lm(formula, data = data)
+        aic <- AIC(model)
+        # select the best model based on AIC
+        if (aic < best_aic) {
+          best_model <- model
+          best_aic <- aic}}}
+    return(best_model)}
+  
+  n_harmonics = 2
+  # create harmonic terms and append to counts
+  for (n in 1:n_harmonics) {
+    sin_term = sin(2*pi*counts$time /(12*n))
+    cos_term = cos(2*pi*counts$time /(12*n))
+    counts[paste0("harmonic_", n, "_sin_term")] <- (1-counts$sc2-counts$post)*sin_term
+    counts[paste0("harmonic_", n, "_cos_term")] <- (1-counts$sc2-counts$post)*cos_term
+    counts[paste0("pandemic_", n, "_sin_season")] <- counts$sc2*sin_term
+    counts[paste0("pandemic_", n, "_cos_season")] <- counts$sc2*cos_term
+    counts[paste0("post_", n, "_sin_season")] <- counts$post*sin_term
+    counts[paste0("post_", n, "_cos_season")] <- counts$post*cos_term}
+  
+  # generate and compare models 
+  best_model <- generate_and_compare_models(counts, n_harmonics)
+  counts$pred = best_model$fitted.values
+  
+  counts = counts %>% filter(month < as.Date("2020-04-01") | month >= as.Date("2021-04-01"))
+  
+  # plot the raw data and the model fit
+  plot <- ggplot(counts, aes(x = month, y = plot_ratio)) +
+    geom_point(data = counts, color = "black") +
+    geom_line(data = (counts %>% filter(month < as.Date("2020-04-01"))),
+              linewidth = 1, aes(x = month, y = pred), color = "darkmagenta") +
+    geom_line(data = (counts %>% filter(month >= as.Date("2021-04-01"))),
+              linewidth = 1, aes(x = month, y = pred), color = "darkmagenta") +
+    ylab(ylabel) +
+    xlab("Month") +
+    scale_x_date(labels = scales::date_format("%Y-%b"), breaks = break_dates) +
+    geom_rect(data = gray_rectangles,
+              aes(xmin = xmin, xmax = xmax, ymin = 0, ymax = 1),
+              fill = "grey80", alpha = 0.2, inherit.aes = FALSE) +
+    geom_vline(xintercept = as.Date("2020-04-01"), linetype = "dashed", color = "black") +
+    geom_vline(xintercept = as.Date("2021-04-01"), linetype = "dashed", color = "black") +
+    theme(axis.text.x = element_text(angle = 90), legend.position = "top", 
+          legend.justification = "left") + labs(color = "") +
+    coord_cartesian(ylim = c(max(min(counts$plot_ratio)-0.025, 0), max(counts$plot_ratio) + 0.025))
+  return(list(plot = plot, best_model = best_model))}
+```
+
+This function takes an object of class "lm" from the output of the function `find_best_model` and prints the estimate and the 95% confidence interval for the following variables: $a_2, B_0, B_2$.
+
+If a linear model was constructed, $a_2$ ("post") represents an additive change in the intercept at the start of the post-emergence phase. If a log-linear model was constructed, $a_2$ ("post") represents a multiplicative (e.g., fold) change in the intercept at the start of the post-emergence phase.
+
+If a linear model was constructed, $B_0$ ("time") represents the slope in the pre-pandemic phase. If a log-linear model was constructed, $B_0$ ("time") represents an annual percent change in volume during the pre-pandemic phase. Slopes are expressed such that the unit of time is assumed to be years.
+
+If a linear model was constructed, $B_2$ ("post_slope") represents an additive change in the slope at the start of the post-emergence phase. If a log-linear model was constructed, $B_2$ ("post_slope") represents a multiplicative change in the slope at the start of the post-emergence phase. Slopes are expressed such that the unit of time is assumed to be years.
+
+```{r}
+# print coefficients and their 95% CIs
+process_lm_output <- function(model) {
+  summary_model <- summary(model)
+  formula_terms <- attr(terms(model), "term.labels")
+  response_var <- as.character(formula(model)[2])
+  # check if "log" response variable
+  has_log_response_var <- grepl("log", response_var)
+  for (term in formula_terms) {
+    coefficients <- coef(model)
+    ci <- confint(model, level = 0.95)
+    if (!grepl("harmonic|season|sc", term)) {
+      if (has_log_response_var) {
+        if (term %in% c("time", "sc_slope", "post_slope")) {
+          coef_value <- round(exp(coefficients[term] * 12), 4)
+          ci_coef <- round(exp(ci[term, ] * 12), 4)
+        } else {
+          coef_value <- round(exp(coefficients[term]), 4)
+          ci_coef <- round(exp(ci[term, ]), 4)}
+        cat("Coefficient:", term, "\n")
+        cat("Value:", coef_value, "\n")
+        cat("Exponentiated 95% CI:", ci_coef[1], "to", ci_coef[2], "\n")
+      } else {
+        if (term %in% c("time", "sc_slope", "post_slope")) {
+          coef_value <- round(coefficients[term] * 12, 4)
+          ci_coef <- round(ci[term, ] * 12, 4)
+        } else {
+          coef_value <- round(coefficients[term], 4)
+          ci_coef <- round(ci[term, ], 4)}
+        cat("Coefficient:", term, "\n")
+        cat("Value:", coef_value, "\n")
+        cat("95% CI:", ci_coef[1], "to", ci_coef[2], "\n")}}}
+  cat("Formula:", as.character(formula(model)), "\n")}
+```
+
+This function takes an object of class "lm" from the output of the function `generate_and_plot_proportion_model` and prints the estimate and the 95% confidence interval for the following variables: $a_0, a_0 + a_2, B_0, B_2$.
+
+$a_0$ ("intercept") represents the average proportion in the pre-pandemic phase. $a_0 + a_2$ ("post intercept") represents the average proportion in the post-emergence phase. $B_0$ ("time") represents the slope in the pre-pandemic phase. $B_2$ ("post_slope") represents the additive change in the slope in the post-emergence phase relative to the pre-pandemic phase. Slopes are expressed such that the unit of time is assumed to be years.
+
+```{r}
+compute_sum_and_ci <- function(lm_model, coef_name_1, coef_name_2, alpha = 0.05) {
+  # extract coefficients and standard errors from the model
+  coef_1 <- ifelse(!is.null(coef_name_1), coef(lm_model)[coef_name_1], 0)
+  coef_2 <- ifelse(!is.null(coef_name_2), coef(lm_model)[coef_name_2], 0)
+  se_1 <- ifelse(!is.null(coef_name_1), sqrt(diag(vcov(lm_model)))[coef_name_1], 0)
+  se_2 <- ifelse(!is.null(coef_name_2), sqrt(diag(vcov(lm_model)))[coef_name_2], 0)
+  
+  # point estimate for the sum
+  est_sum <- coef_1 + coef_2
+  # standard error for the sum
+  se_sum <- sqrt(se_1^2 + se_2^2)
+  margin_of_error <- qnorm(1 - alpha / 2) * se_sum
+  
+  # check if coef names contain "slope" or "time" and adjust CI to be annual (vs monthly)
+  if (grepl("slope|time", coef_name_1)) {
+    ci_lower <- (coef_1 + coef_2 - margin_of_error) * 12
+    ci_upper <- (coef_1 + coef_2 + margin_of_error) * 12
+    est_sum <- 12*(coef_1 + coef_2)
+  } else {
+    ci_lower <- coef_1 + coef_2 - margin_of_error
+    ci_upper <- coef_1 + coef_2 + margin_of_error}
+  
+  result <- list(
+    est_sum = est_sum,
+    ci_lower = ci_lower,
+    ci_upper = ci_upper)
+  return(result)}
+
+# get proportion regression results
+report_prop_coefficients <- function(lm_model, alpha = 0.05) {
+  # extract coefficients and standard errors from the model
+  coef_names <- names(coef(lm_model))
+  
+  # extract desired coefficients
+  intercept_coef <- ifelse("(Intercept)" %in% coef_names, "(Intercept)", NULL)
+  time_coef <- ifelse("time" %in% coef_names, "time", NULL)
+  post_coef <- ifelse("post" %in% coef_names, "post", NULL)
+  post_slope_coef <- ifelse("post_slope" %in% coef_names, "post_slope", NULL)
+  
+  # report intercept and 95% CI
+  if (!is.null(intercept_coef)) {
+    intercept_result <- (compute_sum_and_ci(lm_model, intercept_coef, NULL, alpha))
+    cat("intercept:", round(intercept_result$est_sum, 4), "(", round(intercept_result$ci_lower, 4), "-", round(intercept_result$ci_upper, 4), ")\n")}
+  
+  # report time and 95% CI
+  if (!is.null(time_coef)) {
+    time_result <- compute_sum_and_ci(lm_model, time_coef, NULL, alpha)
+    cat("time:", round(time_result$est_sum, 5), "(", round(time_result$ci_lower, 5), "-", round(time_result$ci_upper, 5), ")\n")}
+  
+  # report intercept + post and 95% CI
+  if (!is.null(intercept_coef) && !is.null(post_coef)) {
+    intercept_post_result <- (compute_sum_and_ci(lm_model, intercept_coef, post_coef, alpha))
+    cat("intercept + post:", round(intercept_post_result$est_sum, 4), "(", round(intercept_post_result$ci_lower, 4), "-", round(intercept_post_result$ci_upper, 4), ")\n")}
+
+  # report post_slope and 95% CI
+  if (!is.null(post_slope_coef)) {
+    time_result <- compute_sum_and_ci(lm_model, post_slope_coef, NULL, alpha)
+    cat("post_slope", round(time_result$est_sum, 5), "(", round(time_result$ci_lower, 5), "-", round(time_result$ci_upper, 5), ")\n")}}
+```
+
+Create objects that will be used for plotting.
+
+```{r}
+# shade every other year
+grey_years <- seq(year(min(flu$date)), year(max(flu$date))-1, by = 2)
+# sequence of 3-mo date intervals
+break_dates <- seq(min(flu$date), max(flu$date)+31, by = "3 months")
+
+# create a df to store gray rectangles
+gray_rectangles <- data.frame(
+  xmin = as.Date(paste(grey_years, "-07-01", sep = "")),
+  xmax = as.Date(paste(grey_years + 1, "-06-30", sep = "")),
+  ymin = 1, ymax = Inf)
+rm(grey_years)
+```
+
+Model the proportion of emergency department patients with a diagnosis of RSV admitted over time (Figure 3A).
+
+```{r}
+# filter for cases where pt was seen in ED and has known disposition
+ed <- pt %>%
+  mutate(ED_Dispo = ifelse(is.na(ED_Dispo), "Unknown", ED_Dispo)) %>%
+  filter(ED_entry == 1)
+
+# model proportion of RSV patients admitted from ED
+fig3a = generate_and_plot_proportion_model(create_plotting_df(ed, "ED_Dispo", 
+                                           "ED_Admission"), "Proportion of ED\n Patients Admitted")
+
+# plot data & report model fits
+fig3a$plot
+summary(fig3a$best_model)
+report_prop_coefficients(fig3a$best_model)
+rm(ed)
+```
+
+Model the proportion of inpatients with a diagnosis of RSV requiring intensive care (Figure 3B).
+
+```{r}
+# model proportion of RSV patients admitted to the ICU or NICU
+pt$ICU_NICU = ifelse(pt$ICU_Flag == "Y" | pt$NICU_Flag == "Y", "Y", "N")
+fig3b = generate_and_plot_proportion_model(create_plotting_df(pt %>%
+        filter(Patient_Type_Title == "Inpatient" | Patient_Type_Title == "Obs Unit"),
+        "ICU_NICU", "Y"), "Proportion of Inpatients\n Admitted to ICU or NICU")
+
+# plot data and report model fits
+fig3b$plot
+summary(fig3b$best_model)
+report_prop_coefficients(fig3b$best_model)
+```
+
+Model the proportion of inpatients with a diagnosis of RSV requiring mechanical ventilation (Figure 3C).
+
+```{r}
+# model proportion of RSV patients mechanically ventilated
+fig3c = generate_and_plot_proportion_model(create_plotting_df(pt %>%
+        filter(Patient_Type_Title == "Inpatient" | Patient_Type_Title == "Obs Unit"),
+        "Mechanical_Vent_Flag", "Y"), "Proportion of Inpatients\n Mechanically Ventilated")
+
+# plot data and report model fits
+fig3c$plot
+summary(fig3c$best_model)
+report_prop_coefficients(fig3c$best_model)
+```
+
+Model the volume of emergency department patients with a diagnosis of RSV admitted over time (Figure 3D).
+
+```{r}
+# filter for patients with ED visit
+ed_admit <- pt %>%
+  mutate(ED_Dispo = ifelse(is.na(ED_Dispo), "Unknown", ED_Dispo)) %>%
+  filter(ED_entry == 1) %>%
+  mutate(month = floor_date(Date, "month")) %>%
+  group_by(month) %>%
+  # count number of admissions
+  summarise(numerator = sum(ED_Dispo == "ED_Admission"))
+
+# model ED admission volume
+ed_vol_model = find_best_model(data.frame("month" = ed_admit$month, "count" = ed_admit$numerator))
+summary(ed_vol_model)
+process_lm_output(ed_vol_model)
+ed_admit$pred_vol = exp(ed_vol_model$fitted.values)
+
+# plot the data
+fig3d <- ggplot(ed_admit, aes(x = month, y = numerator)) +
+  geom_point(data = ed_admit %>%filter(month < as.Date("2020-04-01") | month >= as.Date("2021-04-01")), 
+             aes(x = month, y = numerator), color = "black") + 
+  geom_line(data = ed_admit %>% filter(month < as.Date("2020-04-01")),
+            aes(x = month, y = pred_vol), color = "darkmagenta", linewidth = 1) +
+  geom_line(data = ed_admit %>% filter(month >= as.Date("2021-04-01")),
+            aes(x = month, y = pred_vol), color = "darkmagenta", linewidth = 1) +
+  ylab("ED Admission Volume") +
+  xlab("Month") +
+  coord_cartesian(ylim = c(30, 10000)) +
+  scale_y_log10(breaks = c(30, 100, 300, 1000, 3000, 10000)) +
+  scale_x_date(labels = scales::date_format("%Y-%b"), breaks = break_dates) +
+  geom_rect(
+    data = gray_rectangles,
+    aes(xmin = xmin, xmax = xmax, ymin = 0, ymax = max(ed_admit$numerator) + 100),
+    fill = "grey80", alpha = 0.2, inherit.aes = FALSE) +
+  geom_vline(xintercept = as.Date("2020-04-01"), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = as.Date("2021-04-01"), linetype = "dashed", color = "black") +
+  theme(axis.text.x = element_text(angle = 90), legend.position = "top", 
+        legend.justification = "left") + labs(color = "") 
+fig3d
+```
+
+Model the volume of inpatients with a diagnosis of RSV requiring intensive care (Figure 3E).
+
+```{r}
+# filter for inpatients
+icu_admit <- pt %>%
+  filter(Patient_Type_Title != "ED Visit") %>%
+  mutate(month = floor_date(Date, "month")) %>%
+  group_by(month) %>%
+  # count number of ICU admissions
+  summarise(numerator = sum(ICU_Flag == "Y" | NICU_Flag == "Y"))
+
+# model ICU admission volume
+icu_vol_model = find_best_model(data.frame("month" = icu_admit$month, "count" = icu_admit$numerator))
+summary(icu_vol_model)
+process_lm_output(icu_vol_model)
+icu_admit$pred_vol = exp(icu_vol_model$fitted.values)
+
+# plot the data
+fig3e <- ggplot(icu_admit, aes(x = month, y = numerator)) +
+  geom_point(data = icu_admit %>%filter(month < as.Date("2020-04-01") | month >= as.Date("2021-04-01")), 
+             aes(x = month, y = numerator), color = "black") + 
+  geom_line(data = icu_admit %>% filter(month < as.Date("2020-04-01")),
+            aes(x = month, y = pred_vol), color = "darkmagenta", linewidth = 1) +
+  geom_line(data = icu_admit %>% filter(month >= as.Date("2021-04-01")),
+            aes(x = month, y = pred_vol), color = "darkmagenta", linewidth = 1) +
+  ylab("ICU or NICU Admission Volume") +
+  xlab("Month") +
+  coord_cartesian(ylim = c(10, 3500)) +
+  scale_y_log10(breaks = c(10, 30, 100, 300, 1000, 3000)) +
+  scale_x_date(labels = scales::date_format("%Y-%b"), breaks = break_dates) +
+  geom_rect(
+    data = gray_rectangles,
+    aes(xmin = xmin, xmax = xmax, ymin = 0, ymax = max(icu_admit$numerator) + 100),
+    fill = "grey80", alpha = 0.2, inherit.aes = FALSE) +
+  geom_vline(xintercept = as.Date("2020-04-01"), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = as.Date("2021-04-01"), linetype = "dashed", color = "black") +
+  theme(axis.text.x = element_text(angle = 90), legend.position = "top", 
+        legend.justification = "left") + labs(color = "") 
+fig3e
+```
+
+Model the volume of inpatients with a diagnosis of RSV requiring mechanical ventilation (Figure 3F).
+
+```{r}
+# filter for inpatients
+mv_count <- pt %>%
+  filter(Patient_Type_Title != "ED Visit") %>%
+  mutate(month = floor_date(Date, "month")) %>%
+  group_by(month) %>%
+    # count number of patients mech ventilated
+  summarise(numerator = sum(Mechanical_Vent_Flag == "Y"))
+
+# model mech ventilation volume
+mv_vol_model = find_best_model(data.frame("month" = mv_count$month, "count" = mv_count$numerator + 1)) # enable log fit
+summary(mv_vol_model)
+process_lm_output(mv_vol_model)
+mv_count$pred_vol = exp(mv_vol_model$fitted.values) - 1 # re-adjust
+
+fig3f <- ggplot(mv_count, aes(x = month, y = numerator)) +
+  geom_point(data = mv_count %>%filter(month < as.Date("2020-04-01") | month >= as.Date("2021-04-01")), 
+             aes(x = month, y = numerator), color = "black") + 
+  geom_line(data = mv_count %>% filter(month < as.Date("2020-04-01")),
+            aes(x = month, y = pred_vol), color = "darkmagenta", linewidth = 1) +
+  geom_line(data = mv_count %>% filter(month >= as.Date("2021-04-01")),
+            aes(x = month, y = pred_vol), color = "darkmagenta", linewidth = 1) +
+  ylab("Mechanical Ventilation Volume") +
+  xlab("Month") +
+  coord_cartesian(ylim = c(1, 1000)) +
+  scale_y_log10(breaks = c(1, 3, 10, 30, 100, 300, 1000)) +
+  scale_x_date(labels = scales::date_format("%Y-%b"), breaks = break_dates) +
+  geom_rect(
+    data = gray_rectangles,
+    aes(xmin = xmin, xmax = xmax, ymin = 0, ymax = max(mv_count$numerator) + 100),
+    fill = "grey80", alpha = 0.2, inherit.aes = FALSE) +
+  geom_vline(xintercept = as.Date("2020-04-01"), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = as.Date("2021-04-01"), linetype = "dashed", color = "black") +
+  theme(axis.text.x = element_text(angle = 90), legend.position = "top", 
+        legend.justification = "left") + labs(color = "") 
+fig3f
+```
+
+Generate Figure 3.
+
+```{r}
+fig3 = plot_grid(fig3a$plot, fig3d, fig3b$plot, fig3e, fig3c$plot, fig3f, ncol = 2,
+                 labels = c("A", "D", "B", "E", "C", "F"))
+fig3
+ggsave("figs/fig3.pdf", plot = fig3, width = 12, height = 12)
+rm(ed_admit, icu_admit, mv_count, fig3)
+```
+
+Model the proportion of emergency department patients with a diagnosis of influenza admitted over time (Supplementary Figure 4A).
+
+```{r}
+# count influenza patients admitted to the ED
+flu_ed = flu %>%
+  mutate(numerator = flu$ED_admit, denominator = flu$ED_admit+flu$ED_dc)
+
+# model proportion of influenza patients admitted from ED
+sf4a = generate_and_plot_proportion_model(create_plotting_df(flu_ed, monthly = TRUE),
+                                           "Proportion of ED\n Patients Admitted")
+
+# plot data & report model fits
+sf4a$plot
+summary(sf4a$best_model)
+report_prop_coefficients(sf4a$best_model)
+rm(flu_ed)
+```
+
+Model the proportion of inpatients with a diagnosis of influenza requiring intensive care (Supplementary Figure 4B).
+
+```{r}
+# count influenza inpatients admitted to the ICU or NICU
+flu_icu = flu %>%
+  mutate(numerator = flu$ICU + flu$NICU, denominator = flu$IP)
+
+# model proportion of influenza inpatients receiving intensive care
+sf4b = generate_and_plot_proportion_model(create_plotting_df(flu_icu, 
+        monthly = TRUE), "Proportion of Inpatients\n Admitted to ICU or NICU")
+
+# plot data & report model fits
+sf4b$plot
+summary(sf4b$best_model)
+report_prop_coefficients(sf4b$best_model)
+rm(flu_icu)
+```
+
+Model the proportion of inpatients with a diagnosis of influenza requiring mechanical ventilation (Supplementary Figure 4C).
+
+```{r}
+# count influenza inpatients mech ventilated
+flu_vent = flu %>%
+  mutate(numerator = flu$mech_vent, denominator = flu$IP)
+
+# model proportion of influenza inpatients receiving mech ventilation
+sf4c = generate_and_plot_proportion_model(create_plotting_df(flu_vent, 
+        monthly = TRUE), "Proportion of Inpatients\n Mechanically Ventilated")
+
+# plot data & report model fits
+sf4c$plot
+summary(sf4c$best_model)
+report_prop_coefficients(sf4c$best_model)
+rm(flu_vent)
+```
+
+Generate Supplementary Figure 4.
+
+```{r}
+sf4 <- plot_grid(sf4a$plot, sf4b$plot, sf4c$plot, ncol = 1)
+sf4
+ggsave("figs/suppfig4.pdf", plot = sf4, width = 6, height = 9)
+```
